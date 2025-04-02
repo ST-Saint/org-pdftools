@@ -2,9 +2,9 @@
 ;; Copyright (C) 2020 Alexander Fu Xi
 
 ;; Author: Alexander Fu Xi <fuxialexander@gmail.com>
-;; Maintainer: Alexander Fu Xi <fuxialexnader@gmail.com>
-;; Homepage: https://github.com/fuxialexander/org-pdftools
-;; Version: 1.1
+;; Maintainer: Yayu Wang <st.saint.wyy@gmail.com>
+;; Homepage: https://github.com/st-saint/org-pdftools
+;; Version: 1.4
 ;; Keywords: convenience
 ;; Package-Requires: ((emacs "26.1") (org "9.3.6") (pdf-tools "0.8") (org-noter "1.4.1"))
 
@@ -53,15 +53,15 @@ See `org-pdftools-get-desc-default' as an example."
   :group 'org-pdftools
   :type 'function)
 (defcustom org-pdftools-path-generator #'org-pdftools-abbreviate-file-name
-"Translate your PDF file path the way you like. Take variable `buffer-file-name' as the argument."
+ "Translate your PDF file path the way you like. Take variable `buffer-file-name' as the argument."
   :group 'org-pdftools
   :type 'function)
 (defcustom org-pdftools-path-resolver #'org-pdftools-expand-file-name
-"Resolve your translated PDF file path back to an absolute path."
+ "Resolve your translated PDF file path back to an absolute path."
   :group 'org-pdftools
   :type 'function)
 (defcustom org-pdftools-path-exporter #'org-pdftools-export-file-name
-"Resolve your translated PDF file path back to an absolute or relative path for export."
+ "Resolve your translated PDF file path back to an absolute or relative path for export."
   :group 'org-pdftools
   :type 'function)
 (defcustom org-pdftools-path-translations nil
@@ -88,6 +88,12 @@ And reverse substitutes from `TO' to `FROM' occurs when creating pdf links."
   "Whether prompt to use isearch link or not."
   :group 'org-pdftools
   :type 'boolean)
+
+(defcustom org-pdftools-use-occur-link 't
+  "Whether prompt to use isearch link or not. "
+  :group 'org-pdftools
+  :type 'boolean)
+
 
 (defcustom org-pdftools-export-style 'pdftools
   "Export style of org-pdftools links.
@@ -286,24 +292,72 @@ Returns components of the path"
                    (org-noter--with-valid-session
                     (with-selected-window
                         (org-noter--get-doc-window)
-                      (isearch-mode t)
-                      (let (pdf-isearch-narrow-to-page t)
-                        (isearch-yank-string search-string))
-                        ))
-                 (isearch-mode t)
-                 (let (pdf-isearch-narrow-to-page t)
-                   (isearch-yank-string search-string))))))
-          ((getf pdf-link :pathlist)
-           (pdf-occur-search
-            pathlist
-            occur-search-string))
-          (t (message "Invalid pdf link.")))))
+                      (org-pdftools-occur-goto-heading search-string page)))))))
+          ((string-match
+            "\\(.*\\)@@\\(.*\\)"
+            link)
+           (let* ((paths (match-string 1 link))
+                  (occur-search-string (match-string 2 link))
+                  (pathlist (split-string paths "%&%")))
+             (pdf-occur-search
+              pathlist
+              occur-search-string)))
+          ((org-open-file link 1)))))
+
+(defun org-pdftools-occur-goto-heading (heading page)
+  (pdf-info-make-local-server nil nil)
+  (setq org-pdftools-occur-list '())
+  (setq org-pdftools-occur-string heading)
+  (let* ((documents (pdf-occur-normalize-documents
+                     (list (org-noter--with-valid-session
+                            (org-noter--session-doc-buffer session)))))
+         (batches (pdf-occur-create-batches
+                   documents (or pdf-occur-search-batch-size 1)))
+         (case-fold-search 't)
+         (heading-text (replace-regexp-in-string "^[0-9]+\\(\.[0-9]+\\)? +" "" heading))
+         (heading-text-regex (concat heading-text "$")))
+    (pdf-info-local-batch-query
+     (lambda (document pages)
+       (pdf-info-search-regexp heading-text-regex pages nil document))
+     (lambda (status response document pages)
+       (if status
+           (error "%s" response)
+         (let ((matches
+                (-remove (lambda (m) (not (eq page (cdr (assoc 'page m))))) response)))
+           (if org-pdftools-occur-list
+               (nconc org-pdftools-occur-list matches)
+             (setq org-pdftools-occur-list matches)))))
+     (lambda (status buffer)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (when org-pdftools-occur-list
+             (setq-local exact-match nil)
+             (if (eq 1 (length org-pdftools-occur-list))
+                 (setq-local exact-match (car org-pdftools-occur-list))
+               (let ((exact-matches
+                      (-remove (lambda (em)
+                                 (not (or
+                                       (equal heading (cdr (assoc 'text em)))
+                                       (equal heading-text (cdr (assoc 'text em))))))
+                               org-pdftools-occur-list)))
+                 (if (eq 1 (length exact-matches))
+                     (setq-local exact-match (car exact-matches)))))
+             (when exact-match
+               (setq-local matching-edge (cdr (assoc 'edges exact-match)))
+               (pdf-view-goto-page page)
+               (let ((pixel-match
+                      (pdf-util-scale-relative-to-pixel matching-edge))
+                     (pdf-isearch-batch-mode t))
+                 (pdf-isearch-hl-matches pixel-match nil t)
+                 (pdf-isearch-focus-match-batch pixel-match))
+               t)))))
+     batches)))
 
 (defun org-pdftools-get-link ()
   "Get link from the active pdf buffer."
   (let* ((path
           (with-current-buffer (current-buffer)
-              (funcall org-pdftools-path-generator (buffer-file-name))))
+            (funcall org-pdftools-path-generator (buffer-file-name))))
          (page (pdf-view-current-page))
          (annot-id (if (pdf-view-active-region-p)
                        (pdf-annot-get-id
@@ -356,8 +410,8 @@ Returns components of the path"
                           (cdr (pdf-view-image-size)))))))
          ;; pdf://path::page++height_percent;;annot_id\\|??search-string
          (search-string (if (and (not annot-id)
-                                 org-pdftools-use-isearch-link)
-                            isearch-string
+                                 org-pdftools-use-occur-link)
+                            org-pdftools-occur-string
                           ""))
          (link (concat
 
@@ -378,8 +432,7 @@ Returns components of the path"
                         " "
                         "%20"
                         search-string))
-                    (message
-                     "   Reminder: You haven't performed a isearch!") "")))))
+                    "")))))
     link))
 
 (defun org-pdftools-get-desc-default (file page &optional text)
@@ -412,7 +465,7 @@ Returns components of the path"
          (let* ((file (file-name-base (pdf-view-buffer-file-name)))
                 (quot (if (pdf-view-active-region-p)
                           (replace-regexp-in-string "\n" " "
-                                                    (mapconcat 'identity (pdf-view-active-region-text) ? ))))
+                                                    (mapconcat 'identity (pdf-view-active-region-text) " "))))
                 (page (number-to-string (pdf-view-current-page)))
                 (link (org-pdftools-get-link))
                 (isearchstr (if (string-match (concat ".*" (regexp-quote org-pdftools-search-string-separator) "\\(.*\\)") link)
@@ -424,10 +477,10 @@ Returns components of the path"
             :description desc)))
         ((eq major-mode 'pdf-occur-buffer-mode)
          (let* ((paths (mapconcat #'identity (mapcar #'car
-                         pdf-occur-search-documents) "%&%"))
+                                                     pdf-occur-search-documents) "%&%"))
                 (occur-search-string pdf-occur-search-string)
                 (link (concat org-pdftools-link-prefix ":"
-                       paths "@@" occur-search-string)))
+                              paths "@@" occur-search-string)))
            (org-link-store-props
             :type org-pdftools-link-prefix
             :link link
@@ -505,6 +558,23 @@ and append it. ARG is passed to `org-link-complete-file'."
      (read-from-minibuffer
       "Page:"
       "1"))))
+
+;; (defun org-noter-set-start-location (&optional arg)
+;;   "When opening a session with this document, go to the current location.
+;; With a prefix ARG, remove start location."
+;;   (interactive "P")
+;;   (org-noter--with-valid-session
+;;    (let ((inhibit-read-only t)
+;;          (ast (org-noter--parse-root))
+;;          (location (org-noter--doc-approx-location (when (called-interactively-p 'any) 'interactive))))
+;;      (with-current-buffer (org-noter--session-notes-buffer session)
+;;        (org-with-wide-buffer
+;;         (goto-char (org-element-property :begin ast))
+;;         (if arg
+;;             (org-entry-delete nil org-noter-property-note-location)
+;;           (org-entry-put nil org-noter-property-note-location
+;;                          (org-noter--pretty-print-location location))))))))
+
 
 (provide 'org-pdftools)
 ;;; org-pdftools.el ends here
